@@ -1,0 +1,496 @@
+---
+title: "R_log-log_model"
+author: "Zoltan Aldott"
+date: "24/02/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## Instruction
+
+Before running the code below, please make sure "cmov.csv", "cupc.csv" and the attached file "Modeling.xlsx" are in the same folder. The "input_data1.csv" and "input_data2.csv" will be generated during the code run and will be used in "Modeling.xlsx". Manual pasting of data from the input csv files into the Modelling.xlsx is required if parameters or data is changed. More detailed instructions are explained between the relevant chunks.
+
+## Data Dictionary
+
+Variable     | Description                                                                 
+------------ | -----------------------------------------------------------------------------
+`STORE`      | Store Number
+`UPC`        | The last five digit of the UPC number identify the product, the remaining digits identify the manufacturer
+`WEEK`       | Week Number
+`MOVE`       | Number of unit sold
+`QTY`        | Indicate the size of the bundle (E.g., 3).
+`PRICE`      | Reflect the total price of the bundle (E.g., $2), but move will reflect the number of actual item sold, not the number of bundles.
+`SALE`       | This variable indicates whether the product was sold on a promotion that week. A code of 'B' indicates a Bonus Buy, 'C' indicates a Coupon, 'S' indicate a simple price reduction. * $Sales = Price * Move / Qty$.
+`RPOFIT`     | This variable indicates the gross margin in percent that DFF makes on the sale of the UPC.  A profit of 25.3 means that DFF makes 25.3 cents on the dollar for each item sold. This yields a cost of good sold of 74.7 cents. Have the average acquisition cost (AAC) of the items in inventory. The chain sets retail prices for the next week and also determines AAC at the end of each week, t, according to: * $AAC_{t+1}$ = (Inventory bought in t) Price $paid_{t}$ + (Inventory, end of t-l-$sales_{t}$) $AAC_{t}$
+`OK`         | This is a flag set by us to indicate that the data for that week are suspect. We do not use flagged data in our analysis.
+`PRICE_HEX`  | The full precision in hexadecimal notation of `PRICE`.
+`RPOFIT_HEX` | The full precision in hexadecimal notation of `PROFIT`.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(plm)
+library(Ckmeans.1d.dp)
+library(gridExtra)
+library(readxl)
+```
+
+```{r}
+# Import dataset and UPC dictionary
+cmov<-read_csv("cmov.csv")
+cupc<-read_csv("cupc.csv")
+
+# Set seed for reproducibility
+set.seed(1)
+group_number<-2
+
+# Inspect dataset
+cmov %>% summary
+# All observations have the oK flag. Assuming the dataset's creater is to be trusted, no further analysis checks necessary
+# There are no missing values for the numerical variables used.
+
+# Choose store index
+store_index <- runif(1,min=(1+6*(group_number-1)),max=6*group_number) %>% floor
+
+# Choose store number
+store_num <- cmov$STORE %>% unique %>% sort %>% `[`(store_index)
+
+store_num
+
+# Drop all observations other than the chosen store.
+cmov<-cmov %>% filter(STORE==store_num)
+
+# Join dataset with UPC dictionary
+cmov<-cmov %>% left_join(cupc,by="UPC") %>% mutate(DESCRIP=factor(DESCRIP))
+
+# Uncomment line below to confirm consistency of results regardless of reference category.
+# cmov$DESCRIP<-cmov$DESCRIP %>% relevel(ref="KR PHILA CREAM CHEES") 
+
+# Create ID column where observations of the same brand are ordered by time. 
+# This is required for the match_price_history helper function below.
+cmov$ID<-paste0(cmov$UPC,str_pad(cmov$WEEK,width=3,side="left",pad="0")) %>% as.numeric
+
+# Create variable to be used in regression to capture weekly seasonality.
+# Note that based on https://www.chicagobooth.edu/-/media/enterprise/centers/kilts/datasets/dominicks-dataset/dominicks-manual-and-codebook_kiltscenter.aspx
+# week numbers do not start on the first week of January.
+cmov <- cmov %>% mutate(week_in_year=WEEK %% 52)
+cmov$week_in_year<-ifelse(cmov$week_in_year==0,52,cmov$week_in_year) %>% as.factor
+
+# Create log price and log movement (demand quantity since QTY is 1 throughout the dataset).
+cmov <- cmov %>% mutate(log_move=log(MOVE),log_price = log(PRICE))
+
+# The package plm would treat WEEK as factor since it is defined as an index.
+# Additional trend variable created to capture the linear trend
+cmov$trend <- cmov$WEEK
+
+#Training & Testing sample split. Use last 15% of the data to evaluate forecasting performance.
+cutoff <- floor(max(cmov$WEEK)*0.85)
+
+training<-cmov %>% filter(WEEK<=cutoff)
+test<-cmov %>% filter(WEEK>cutoff)
+
+# Create separate test sets to evaluate forecasting performance separately for different brands.
+test_phila<-test %>% filter(DESCRIP!="DOM CREAM CHEESE")
+test_dom<-test %>% filter(DESCRIP=="DOM CREAM CHEESE")
+
+```
+
+```{r helpers}
+## Helper functions to work with plm model objects.
+
+
+# Used to retrieve the M last empirical log prices for an entry with ID entryID.
+# Predictions are only generated for late periods in the dataset, so separate handling 
+# of the first few observations with no matchable price history is unnecessary.
+match_price_history<-function(entryID,M){
+  
+  res=data.frame()
+  for (m in 0:M){
+    
+    #IDs were created with this lookup method in mind, IDs are ordered by time.
+    price_val<-cmov[cmov["ID"]==entryID-m,"log_price"]
+    res<-res %>% bind_rows(data.frame(m=m,
+                                      log_price=price_val))
+  }
+  return(res)
+}
+
+# Generate log-move prediction for a given entry using given model with M log-price lags.
+# Price history can be given to generate predictions for hypothetical price histories.
+# If no price history is given, the empirical price histories will be matched.
+prediction<-function(entry,model,M,price_history=NULL){
+    
+    # Ensure that prediction is correct even if the reference brand changes.
+    brand_is_not_reference<-(paste0("DESCRIP",entry$DESCRIP) %in% names(model$coefficients))
+    
+    # Determine brand intercept
+    brand_coeff<-ifelse(brand_is_not_reference,
+                      model$coefficients["(Intercept)"]+model$coefficients[paste0("DESCRIP",entry$DESCRIP)],
+                      model$coefficients["(Intercept)"])
+    # Initialise prediction at brand intercept
+    prediction<-brand_coeff
+    
+    # Extract week coefficients
+    weekcoeffs<-map(2:52,function(i){model$coefficients[paste0("week_in_year",i)]}) %>% unlist
+    
+    # Since reference week is 1, coefficient is 0.
+    weekcoeffs["week_in_year1"]<-0
+    
+    # Add week intercept
+    prediction<-prediction + weekcoeffs[paste0("week_in_year",as.numeric(entry$week_in_year))]
+
+    # Add trend effect
+    prediction<-prediction + unname((model$coefficients["trend"]*entry$trend))
+    
+    # If no price history is given, use match_price_history helper to retrieve historical prices.
+    if(is.null(price_history)) {
+      matched_prices=match_price_history(entry$ID,M)
+    } else {
+      matched_prices=price_history
+    }
+    
+    # loop through M price effects
+    for (m in 0:M) {
+      
+      # If the brand of the entry is the reference brand, use only the base coefficient.
+      # Else, add also the offset coefficients (see Modelling chunk for details)
+      if (!brand_is_not_reference){
+        
+        # In the M=0 case, the coefficients are named differently, hence the need for the nested if statement.
+        if(M!=0){
+          prediction <- prediction + 
+          unname(model$coefficients[paste0("lag(log_price, 0:M)",m)]* 
+                   matched_prices[matched_prices["m"]==m,"log_price"])
+        } else {
+          prediction <- prediction + unname(model$coefficients[paste0("lag(log_price, 0:M)")]* 
+                   matched_prices[matched_prices["m"]==m,"log_price"])
+        }
+      } else {
+        
+        # In the M=0 case, the coefficients are named differently, hence the need for the nested if statement.
+        if(M!=0){
+          prediction <- prediction + 
+          unname((model$coefficients[paste0("lag(log_price, 0:M)",m)] + 
+                    model$coefficients[paste0("DESCRIP",entry$DESCRIP,":lag(log_price, 0:M)",m)])* 
+                   matched_prices[matched_prices["m"]==m,"log_price"])
+        } else {
+          prediction <- prediction + 
+          unname((model$coefficients[paste0("lag(log_price, 0:M)")] + 
+                    model$coefficients[paste0("DESCRIP",entry$DESCRIP,":lag(log_price, 0:M)")])* 
+                   matched_prices[matched_prices["m"]==m,"log_price"])
+        }
+      }
+    }
+    return(prediction)
+}
+
+# Generate absolute percentage error for given entry.
+# Entry needs to have "pred" column defined.
+get_ape<-function(entry){
+  actual<-entry$MOVE
+  ape<-unname(abs((actual-exp(entry$pred))/actual))
+  return(ape)
+}
+
+# Generate predictions and calculate MAPE for a given model and test set with M price lags.
+eval_model<-function(model,test_set,M){
+  # Convert test set into list of lines
+  test_set_list<-split(test_set,seq(nrow(test_set)))
+  
+  # Create temporary dataframe
+  test_set_withpreds<-test_set
+  
+  # Generate predictions for test set
+  test_set_withpreds$pred<-sapply(test_set_list,prediction,loglogmodel,M)
+  
+  # Convert dataframe into list of rows for map
+  test_set_withpreds_list<-split(test_set_withpreds,seq(nrow(test_set_withpreds)))
+  
+  # Calculate mape
+  mape<-map(test_set_withpreds_list,get_ape) %>% do.call(c,.) %>% unlist %>% mean
+  return(mape)
+}
+
+```
+
+plm package is used to run panel regression.
+
+Model ran is the reparametrisation of Cohen et al. (2017) Equation 18:
+
+Reference brand is Dom Cheese.
+Dummy variable $PHILA_i = 1$ if an observation is for the brand Philadelphia.
+week_in_year_t is equivalent to WEEK_t in Cohen et al. (2017)
+
+$$ log(d_{it})=\beta^0_1+\beta^0_2PHILA_i+\beta^1t+\sum_{j=2}^{52}\beta^2_jweek\_in\_year_t+\sum_{m=0}^M\beta^3_{m}log(price_t)+\sum_{m=0}^M\beta^{3'}_{m}log(price_t)*PHILA_i+\epsilon_{it} $$
+
+The $\beta^3_{im}$ from Equation 18 in Cohen et al. (2017) can be reconstructed as:
+$$ \beta^3_{im}=\begin{cases}
+                  \beta^3_m \quad \text{if } PHILA_i=0\\
+                  \beta^3_m+\beta^{3'}_m \quad \text{if } PHILA_i=1\\
+               \end{cases} $$
+
+
+```{r modelling}
+
+res=data.frame()
+#Run and evaluate Panel regressions for different values of M.
+for (M in c(0,1,2,3,4)) {
+  loglogmodel<-plm(log_move~DESCRIP*lag(log_price, 0:M)+trend+week_in_year,
+                   data=training,
+                   index=c("DESCRIP","WEEK"),
+                   model="pooling")
+  model_sum<-loglogmodel %>% summary
+  
+  # Evaluation based on out of sample MAPE for individual brands and combined
+  res<-res %>% bind_rows(data.frame(M=M,
+                                    phila_mape=eval_model(loglogmodel,test_phila,M),
+                                    dom_mape=eval_model(loglogmodel,test_dom,M),
+                                    overall_mape=eval_model(loglogmodel,test_set = test,M)))
+  
+}
+
+# Choose M based on lowest out-of-sample MAPE for Philadelphia, since it is the optimised brand in T4.
+M<-res[res$phila_mape==min(res$phila_mape),"M"]
+
+#Estimate final_model again
+final_model<-plm(log_move~DESCRIP*lag(log_price, 0:M)+trend+week_in_year,
+                 data=training,
+                 index=c("DESCRIP","WEEK"),
+                 model="pooling")
+```
+
+
+```{r Optimisation_parameter_estimation}
+
+# Choosing optimisation period
+cmov <- cmov %>% mutate(label=ifelse(WEEK>=220 & WEEK<=300, 1,0))
+
+ggplot(cmov %>% filter(DESCRIP=="KR PHILA CREAM CHEES"),aes(x=WEEK,y=PRICE))+geom_line()+
+  geom_vline(xintercept = c(220,300), color="red", linetype="dashed")+
+  labs(x="Week t", y="Product Price", title="Price of Philadelphia Cheese over Time") +
+  geom_text(x=230,y=0.48,label="220",color="red",size=3) +
+  geom_text(x=310,y=0.48,label="300",color="red",size=3)
+  
+# Observe changing baseline price and price-ladder
+
+# Choose period with longest stable baseline-price
+start=220
+end=300
+
+# Visualise optimisation period.
+ggplot(cmov %>% filter(DESCRIP=="KR PHILA CREAM CHEES"& (WEEK>=start&WEEK<=end)),aes(x=WEEK,y=PRICE))+geom_line() +
+   labs(x="Week t", y="Product Price", title="Price of Philadelphia cheese between WEEK 220 and 300")
+
+# Create dataset for the optimisation period.
+optimisation_set<-cmov %>% filter(DESCRIP=="KR PHILA CREAM CHEES" & (WEEK>=start&WEEK<=end))
+
+
+optimisation_set %>% count(PRICE) %>% arrange(desc(n))
+# Observe high variety of prices (18 different prices within the pariod) with some very close to each other (e.g. 1.31, 1.32, 1.33)
+# Discrete price ladder business rule mentioned in Cohen et al. (2017) seemingly violated. 
+# In order to discretise the problem for the CIP, 1-dimensional K-medians clustering is used to construct a pseudo-price-ladder
+# K is chosen as 7, as this is the highest number of clusters that gets rid of the <5 cent variations of prices.
+# These small variations are assumed to not have an effect of demand, and should not make a large difference.
+
+K=7
+
+# Run clustering algorithm
+(price_clustering<-Ckmedian.1d.dp(optimisation_set$PRICE,k=K))
+
+# Assign cluster numbers to observations
+optimisation_set$cluster_nr<-price_clustering$cluster
+
+# Construct cluster-price dictionary
+cluster_dictionary<-data.frame(cluster_nr=seq(1,K),cluster_price=price_clustering$centers)
+
+cluster_dictionary<-cluster_dictionary %>% mutate(log_price=log(cluster_price))
+
+# Assign cluster prices to observations based on dictionary
+optimisation_set$cluster_price<-optimisation_set %>% select(cluster_nr) %>% left_join(cluster_dictionary) %>% pull(cluster_price)
+
+## Estimate S
+
+# Note: When looking at empirical prices instead of cluster price,
+# there does not seem to be a strict rule of time between promotions (S=0)
+ggplot(optimisation_set,aes(x=WEEK,y=PRICE))+geom_line()+
+  labs(x="Week t", y="Product Price", title="Prices Trend over Time")
+
+# When looking at clusters, there do seem to be periods between discounts from the baseline price
+ggplot(optimisation_set,aes(x=WEEK,y=cluster_price))+geom_line()+
+  labs(x="Week t", y="Pseudo Price Ladder", title="Re-assigned Prices Trend over Time")
+
+# Define most frequently observed cluster as baseline
+baseline_cluster<-optimisation_set %>% count(cluster_nr) %>% arrange(desc(n)) %>% `[`(1,1) %>% unlist
+
+
+# Loop variables
+consecutives<-data.frame()
+consecutive_id=0
+counter=0
+# Based on cluster prices, calculate consecutive times prices are at the baseline
+for (week in start:end) {
+  if(optimisation_set[optimisation_set$WEEK==week,"cluster_nr"]==baseline_cluster){
+    counter<-counter+1
+  } else if (counter!=0) {
+    consecutives<-consecutives %>% bind_rows(data.frame(ID=consecutive_id,count=counter))
+    counter<-0
+    consecutive_id<-consecutive_id+1
+  }
+}
+if (counter>=1) {
+  consecutives<-consecutives %>% bind_rows(data.frame(ID=consecutive_id,count=counter))
+  }
+
+# Add final counter state.
+
+ggplot(consecutives, aes(x=count,y=..count..))+geom_histogram() +
+  labs(x="Number of Periods", y="Frequency", title="Frequency of Intervals between Promotions")
+# Few instances of only 1 and 2 periods between promotions are observed even with clustering
+# This shows no support for the existence of a business rule that determines a minimum time between promotions.
+
+# Nonetheless, given Proposition 1 in Cohen et al. (2017),
+# to ensure ensure optimality of CIP with M=3 => S=3
+# Since most of the observed distribution of intervals between promotions falls between 3 and 4,
+# this will only restrict our solution slightly compared to the observed values.
+
+chosenS=3
+
+## Choose L
+
+# Observe that the optmisation period starts and ends at the baseline price.
+ggplot(optimisation_set,aes(x=WEEK,y=cluster_price))+geom_line()
+
+# Number of promotions in the period equal to the number of times consecutive baseline pricing was broken -1.
+((consecutives %>% nrow())-1)
+
+# Since there is no information on the maximum number of promotions over any fixed period
+# and in order to ensure conservative optimised objective estimates,
+# L is assumed to be equal to the number of observed promotions in the period.
+
+chosenL<-((consecutives %>% nrow())-1)
+
+## Estimate b coefficients
+
+# In order to estimate POP(p_0), need a profit measure.
+# Attempt to estimate unit cost:
+
+# Construct empirical implied unit cost from prices and profit margins in optimisation set.
+optimisation_set<-mutate(optimisation_set,implied_unit_cost=PRICE*(1-PROFIT/100))
+
+ggplot(optimisation_set,aes(x=WEEK,y=implied_unit_cost))+geom_line() + 
+  labs(title="Implied unit cost over time in the optimisation period",x="Week",y="Implied unit cost")
+# Observe varying unit cost over time
+ggplot(optimisation_set,aes(x=implied_unit_cost,y=..density..))+geom_histogram()
+# Observe bimodal distribution.
+# Overall, it would be a strong assumption to fix unit cost at a fixed level.
+
+# Observe that profit margins also seem to be varying at the price-level
+optimisation_set %>% filter(cluster_price==PRICE) %>% count(PRICE,PROFIT)
+
+# As an alternative solution with a slightly weaker, albeit still strong assumption:
+# Assuming that profit margins depend only on the price-level and does not vary systematically over time,
+# estimate profit margins for median price of every cluster as the average of profit margins observed empirically for that price.
+
+cluster_dictionary$mean_profit<-optimisation_set %>% 
+  filter(cluster_price==PRICE) %>%
+  group_by(cluster_nr) %>% 
+  summarize(mean_profit=mean(PROFIT)/100) %>% pull(mean_profit)
+
+# Generate empty dataframe to populate for POP(P_0).
+POPp_0<-data.frame(WEEK=start:end,baseline_profit=0,default_sales_qty=0)
+
+# Get the baseline price
+baseline_price<-cluster_dictionary[baseline_cluster,"log_price"]
+
+# Loop through every week of the optimisation period.
+for (week in start:end){
+  # Get entry associated with the week.
+  entry<-optimisation_set[optimisation_set$WEEK==week,]
+  
+  # Generate quantity prediction for a price history always at the baseline price.
+  pred<-prediction(entry=entry,model = final_model,M = M,
+                   price_history = data.frame(m=seq(0,M),log_price=baseline_price))
+  
+  POPp_0[POPp_0$WEEK==week,"baseline_profit"]<-exp(pred)*cluster_dictionary[baseline_cluster,"mean_profit"]*exp(baseline_price)
+  POPp_0[POPp_0$WEEK==week,"default_sales_qty"]<-exp(pred)
+}
+
+# Create empty dataframe to populate for POP(p_k) -> Instead of matrix, use a long format data frame.
+POPp_tk<-data.frame(WEEK=rep(start:end,K-1),cluster=rep(1:(K-1),each=end-start+1),expected_profit=0,expected_sales_qty=0)
+
+# Loop through every non-baseline cluster-price for each week.
+for (cluster in 1:(K-1)){
+  
+  # Get price for the current cluster to be evaluated
+    cluster_price<-cluster_dictionary[cluster,"log_price"]
+    
+  for (week in start:end){
+    
+    # Construct hypothetical price history with the evaluated cluster price set as price in period 0 
+    # and the baseline price for the M periods before.
+    hypothetical_price_history<-data.frame(m=seq(0,M),log_price=c(cluster_price,rep(baseline_price,M)))
+    
+    # Get entry for the current week
+    entry<-optimisation_set[optimisation_set$WEEK==week,]
+    
+    # Generate prediction given the hypothetical price history
+    pred<-prediction(entry=entry,model = final_model,M = M,
+                     price_history = hypothetical_price_history)
+    
+    # Save expected profit and sales quantities.
+    POPp_tk[POPp_tk$WEEK==week&POPp_tk$cluster==cluster,"expected_profit"]<-exp(pred)*cluster_dictionary[cluster,"mean_profit"]*exp(cluster_price)
+    POPp_tk[POPp_tk$WEEK==week&POPp_tk$cluster==cluster,"expected_sales_qty"]<-exp(pred)
+  }
+}
+
+# Generate b_tk for every week
+POPp_tk$b_tk<-POPp_tk$expected_profit-rep(POPp_0$baseline_profit,K-1)
+
+# Calculate b_tilde_t
+input1<-POPp_tk %>% group_by(WEEK) %>% filter(b_tk==max(b_tk)) %>% ungroup() %>% rename("b_tilde_t"="b_tk")
+input1<-input1 %>% bind_cols(POPp_0 %>% select(default_sales_qty))
+
+
+# Write data for the Excel optimisation model
+write_csv(input1,"input_data1.csv")
+
+input2<-cluster_dictionary %>% select(cluster_nr,cluster_price)
+write_csv(input2,"input_data2.csv")
+
+```
+
+Note: if any of the values were changed, data needs to be pasted from input_data1.csv and input_data2.csv into Modelling.xlsx before running the next chunk.
+
+```{r optimisation_results}
+
+## Calculating baseline profit for every period
+optimisation_set<-optimisation_set %>% mutate(profit_on_sales=MOVE*PRICE*PROFIT/100)
+
+#Plotting prices, sales quantities and profit on sales over time
+g1<-ggplot(optimisation_set,aes(x=WEEK,y=PRICE))+geom_line()+labs(x="Week t",y="Emipirical Price",title="Empirical Sales Situation")
+g2<-ggplot(optimisation_set,aes(x=WEEK,y=MOVE))+geom_line()+labs(x="Week t",y="Sales")
+g3<-ggplot(optimisation_set,aes(x=WEEK,y=profit_on_sales))+geom_line()+labs(x="Week t",y="Profit")
+grid.arrange(g1,g2,g3,nrow=3)
+
+#Calculate total profit empirically
+(empirical_profit<-optimisation_set$profit_on_sales %>% sum())
+
+# Read modelling results
+excel_output<-read_xlsx("Modeling.xlsx",sheet = 4)
+
+#Plot expected time-series of optimised results
+g1<-ggplot(excel_output,aes(x=WEEK,y=Price))+geom_line()+labs(x="Week t",y="Product Price",title="Predicted Sales Situation after Optimisation")
+g2<-ggplot(excel_output,aes(x=WEEK,y=Predicted_sales))+geom_line()+labs(x="Week t",y="Predicted Sales")
+g3<-ggplot(excel_output,aes(x=WEEK,y=Predicted_profit))+geom_line()+labs(x="Week t",y="Predicted Profit")
+grid.arrange(g1,g2,g3,nrow=3)
+
+#Calculated expected total profit in the optimisation period
+(optimised_profit<-excel_output$Predicted_profit %>% sum())
+
+#Percentage expected profit increase after optimisation.
+(optimised_profit-empirical_profit)/empirical_profit*100
+```
+
+
